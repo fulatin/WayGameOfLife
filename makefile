@@ -1,4 +1,2 @@
-wayland_header:
-	wayland-scanner
-all: wayland_header
+all:
 	gcc -o client ./xdg-private.c ./client.c -lwayland-client -lrt
