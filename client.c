@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <wayland-client-core.h>
 #include <xkbcommon/xkbcommon.h>
 
 #include <errno.h>
@@ -62,8 +63,9 @@ struct state {
   struct wl_seat *seat;
   struct wl_compositor *compositor;
   struct wl_shm *shm;
+  struct wl_shm_pool *shm_pool;
   struct xdg_wm_base *xdg_base;
-
+  struct xdg_toplevel *tp_surf;
   struct wl_surface *surface;
   struct wl_keyboard *keyboard;
   struct xdg_surface *xdg_suf;
@@ -73,11 +75,14 @@ struct state {
   struct xkb_keymap *xkb_keymap;
   struct xkb_state *xkb_state;
   int offset;
-  uint32_t time;
-
+  uint32_t last_time;
+  int frame_rate;
+  int sugg_width, sugg_heigth;
   int grid[GRID_HEIGHT][GRID_WIDTH];
-  uint32_t *buffer;
-  int buffer_fd;
+  int configured;
+  int pool_size;
+  // uint32_t *buffer;
+  // int buffer_fd;
 };
 
 int grid_check_valid_position(int grid[GRID_HEIGHT][GRID_WIDTH], int x, int y) {
@@ -102,7 +107,7 @@ int grid_get_around(int grid[GRID_HEIGHT][GRID_WIDTH], int x, int y) {
 void grid_update(int grid[GRID_HEIGHT][GRID_WIDTH]) {
   int tmp[GRID_HEIGHT][GRID_WIDTH];
   for (int i = 0; i < GRID_HEIGHT; ++i) {
-    for (int j = 0; j <= GRID_WIDTH; ++j) {
+    for (int j = 0; j < GRID_WIDTH; ++j) {
       int around = grid_get_around(grid, i, j);
       if (grid[i][j] != 0) {
         if (around < 2 || around > 3)
@@ -124,10 +129,11 @@ void grid_update(int grid[GRID_HEIGHT][GRID_WIDTH]) {
   }
 }
 
-const int width = 700;
-const int height = 700;
-const int stride = width * 4;
-const int shm_pool_size = height * stride;
+int width = 700;
+int height = 700;
+#define STRIDE(width) (width * 4)
+
+#define SHM_POLL_SIZE(height, stride) = height * stride;
 
 void my_xdg_wm_base_ping_callback(void *data, struct xdg_wm_base *xdg_wm_base,
                                   uint32_t serial) {
@@ -145,9 +151,9 @@ struct wl_buffer_listener my_wl_buf_listener = {.release =
                                                     wl_buf_release_handler};
 
 struct wl_buffer *draw_buffer_data(struct state *state) {
-  int fd = allocate_shm_file(height * stride);
-  uint32_t *data = (uint32_t *)mmap(0, height * stride, PROT_READ | PROT_WRITE,
-                                    MAP_SHARED, fd, 0);
+  int fd = allocate_shm_file(height * STRIDE(width));
+  uint32_t *data = (uint32_t *)mmap(0, height * STRIDE(width),
+                                    PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 
   for (int i = 0; i < height; ++i) {
     for (int j = 0; j < width; ++j) {
@@ -162,47 +168,38 @@ struct wl_buffer *draw_buffer_data(struct state *state) {
       }
     }
   }
-  struct wl_shm_pool *smp = wl_shm_create_pool(state->shm, fd, height * stride);
+  struct wl_shm_pool *smp =
+      wl_shm_create_pool(state->shm, fd, height * STRIDE(width));
   struct wl_buffer *buf = wl_shm_pool_create_buffer(
-      smp, 0, width, height, stride, WL_SHM_FORMAT_XRGB8888);
+      smp, 0, width, height, STRIDE(width), WL_SHM_FORMAT_XRGB8888);
   wl_buffer_add_listener(buf, &my_wl_buf_listener, state);
-  munmap(data, height * stride);
+  munmap(data, height * STRIDE(width));
   close(fd);
   return buf;
 }
 struct wl_buffer *create_buffer(struct state *state) {
-  struct wl_shm_pool *smp =
-      wl_shm_create_pool(state->shm, state->buffer_fd, height * stride);
+  struct wl_shm_pool *smp = state->shm_pool;
   struct wl_buffer *buf = wl_shm_pool_create_buffer(
-      smp, 0, width, height, stride, WL_SHM_FORMAT_XRGB8888);
+      smp, 0, width, height, STRIDE(width), WL_SHM_FORMAT_XRGB8888);
+  wl_buffer_set_user_data(buf, (void *)1);
   wl_buffer_add_listener(buf, &my_wl_buf_listener, state);
   return buf;
 }
 void update_buffer(struct state *state) {
-  uint32_t *data = state->buffer;
+  uint32_t *data = wl_shm_pool_get_user_data(state->shm_pool);
   for (int i = 0; i < height; ++i) {
     for (int j = 0; j < width; ++j) {
       int map_grid_posx = i * GRID_HEIGHT / height;
 
       int map_grid_posy = j * GRID_WIDTH / width;
       if (state->grid[map_grid_posx][map_grid_posy]) {
-        data[+i * width + j] =
+        data[i * width + j] =
             0xAA000000 + 1000 * state->grid[map_grid_posx][map_grid_posy];
       } else {
-        data[+i * width + j] = 0xAAFFFFFF;
+        data[i * width + j] = 0xAAFFFFFF;
       }
     }
   }
-}
-void my_xdg_surface_configure_callback(void *data,
-                                       struct xdg_surface *xdg_surface,
-                                       uint32_t serial) {
-  struct state *my_state = data;
-  xdg_surface_ack_configure(xdg_surface, serial);
-  struct wl_buffer *buf = draw_buffer_data(my_state);
-  wl_surface_attach(my_state->surface, buf, 0, 0);
-  // wl_surface_damage_buffer(my_state->surface, 0, 0, width, height);
-  wl_surface_commit(my_state->surface);
 }
 
 void my_wl_keyboard_keymap_callback(void *data, struct wl_keyboard *wl_keyboard,
@@ -277,9 +274,6 @@ void my_wl_seat_name_callback(void *data, struct wl_seat *wl_seat,
 struct xdg_wm_base_listener xwb_listener = {.ping =
                                                 my_xdg_wm_base_ping_callback};
 
-struct xdg_surface_listener xs_listener = {
-    .configure = my_xdg_surface_configure_callback};
-
 struct wl_seat_listener my_wl_seat_listener = {
     .capabilities = my_wl_seat_capability_callback,
     .name = my_wl_seat_name_callback};
@@ -314,25 +308,106 @@ struct wl_registry_listener my_reg_handle = {
 
 void xdg_suf_configure(void *data, struct xdg_surface *xdg_surface,
                        uint32_t serial) {
+  printf("xdg surface configuring\n");
   xdg_surface_ack_configure(xdg_surface, serial);
+  struct state *my_state = data;
+  // 绘制内容到共享内存
+  if (!my_state->configured) {
+
+    update_buffer(my_state);
+    // 创建一个新的 wl_buffer（注意：这里最好实现双缓冲，避免重用竞争）
+    struct wl_buffer *buf = create_buffer(my_state);
+
+    wl_surface_attach(my_state->surface, buf, 0, 0);
+    wl_surface_damage(my_state->surface, 0, 0, width, height);
+    wl_surface_commit(my_state->surface);
+    my_state->configured = 1;
+  }
+  // 更新 last_time，为后续帧率控制做准备
+  // 注意：这里获取时间戳比较麻烦，可以简单地设为 0，让第一帧不受限
+  my_state->last_time = 0;
+  if (my_state->sugg_heigth == 0 && my_state->sugg_width == 0) {
+    return;
+  }
+  if (my_state->sugg_heigth * STRIDE(my_state->sugg_width) >
+      my_state->pool_size) {
+    uint32_t *dataptr =
+        (uint32_t *)wl_shm_pool_get_user_data(my_state->shm_pool);
+    munmap(dataptr, height * STRIDE(width));
+    wl_shm_pool_destroy(my_state->shm_pool);
+    height = my_state->sugg_heigth;
+    width = my_state->sugg_width;
+    int fd = allocate_shm_file(height * STRIDE(width));
+    uint32_t *data = (uint32_t *)mmap(
+        0, height * STRIDE(width), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    my_state->shm_pool =
+        wl_shm_create_pool(my_state->shm, fd, height * STRIDE(width));
+    // surface frame callback
+    close(fd);
+    wl_shm_pool_set_user_data(my_state->shm_pool, data);
+  }
+  height = my_state->sugg_heigth;
+  width = my_state->sugg_width;
+  my_state->sugg_heigth = 0;
+  my_state->sugg_width = 0;
 }
 struct xdg_surface_listener xdg_suf_listener = {.configure = xdg_suf_configure};
+
+void xdg_tp_configure(void *data, struct xdg_toplevel *xdg_toplevel,
+                      int32_t width, int32_t height, struct wl_array *states) {
+  printf("xdg toplevel configuring %d %d\n", width, height);
+  struct state *my_state = data;
+  if (width == 0 && height == 0)
+    return;
+  my_state->sugg_width = width;
+  my_state->sugg_heigth = height;
+}
+void xdg_tp_close(void *data, struct xdg_toplevel *xdg_toplevel) {
+  printf("I should close\n");
+}
+
+void xdg_tp_configure_bounds(void *data, struct xdg_toplevel *xdg_toplevel,
+                             int32_t width, int32_t height) {
+  printf("configure bounds %d %d\n", width, height);
+}
+
+void xdg_tp_wm_capabilities(void *data, struct xdg_toplevel *xdg_toplevel,
+                            struct wl_array *capabilities) {}
+struct xdg_toplevel_listener xdg_tp_suf_listener = {
+    .configure = xdg_tp_configure,
+    .close = xdg_tp_close,
+    .configure_bounds = xdg_tp_configure_bounds,
+    .wm_capabilities = xdg_tp_wm_capabilities};
+
+struct wl_callback_listener frame_callback_listener;
+void done(void *data, struct wl_callback *wl_callback, uint32_t callback_data) {
+  printf("enter done %d\n", callback_data);
+  struct state *my_state = data;
+  if (callback_data - my_state->last_time >= 1000 / my_state->frame_rate) {
+    grid_update(my_state->grid);
+    my_state->last_time = callback_data;
+  }
+
+  struct wl_buffer *buf = create_buffer(my_state);
+  update_buffer(my_state);
+  wl_surface_attach(my_state->surface, buf, 0, 0);
+  wl_surface_damage(my_state->surface, 0, 0, width, height);
+  struct wl_callback *cb = wl_surface_frame(my_state->surface);
+  wl_callback_add_listener(cb, &frame_callback_listener, my_state);
+
+  wl_surface_commit(my_state->surface);
+  wl_callback_destroy(wl_callback);
+}
+
+struct wl_callback_listener frame_callback_listener = {.done = done};
 int main() {
   struct state my_state = {0};
   struct wl_display *disp = wl_display_connect(NULL);
 
   struct wl_registry *reg = wl_display_get_registry(disp);
   wl_registry_add_listener(reg, &my_reg_handle, &my_state);
+
   wl_display_roundtrip(disp);
-
-  my_state.surface = wl_compositor_create_surface(my_state.compositor);
-
-  my_state.xdg_suf =
-      xdg_wm_base_get_xdg_surface(my_state.xdg_base, my_state.surface);
-  xdg_surface_add_listener(my_state.xdg_suf, &xs_listener, &my_state);
-  my_state.xdg_tp = xdg_surface_get_toplevel(my_state.xdg_suf);
-  xdg_toplevel_set_title(my_state.xdg_tp, "my wayland client");
-  wl_surface_commit(my_state.surface);
   for (int i = 0; i < GRID_HEIGHT; ++i) {
     for (int j = 0; j < GRID_WIDTH; ++j) {
       my_state.grid[i][j] = rand() % 2;
@@ -342,34 +417,33 @@ int main() {
   // xkb init
   my_state.xkb_context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
 
-  int fd = allocate_shm_file(height * stride);
-  uint32_t *data = (uint32_t *)mmap(0, height * stride, PROT_READ | PROT_WRITE,
-                                    MAP_SHARED, fd, 0);
-  my_state.buffer = data;
-  my_state.buffer_fd = fd;
+  my_state.frame_rate = 60;
+  my_state.pool_size = height * STRIDE(width);
+  int fd = allocate_shm_file(height * STRIDE(width));
+
+  uint32_t *data = (uint32_t *)mmap(0, height * STRIDE(width),
+                                    PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  my_state.shm_pool =
+      wl_shm_create_pool(my_state.shm, fd, height * STRIDE(width));
   // surface frame callback
+  close(fd);
+  wl_shm_pool_set_user_data(my_state.shm_pool, data);
+  uint32_t *shmpooladdr = wl_shm_pool_get_user_data(my_state.shm_pool);
+
+  printf("%p %p\n", data, shmpooladdr);
   struct wl_surface *xdg_wlsurf =
       wl_compositor_create_surface(my_state.compositor);
+  my_state.surface = xdg_wlsurf;
   struct xdg_surface *xdgsuf =
       xdg_wm_base_get_xdg_surface(my_state.xdg_base, xdg_wlsurf);
   xdg_surface_add_listener(xdgsuf, &xdg_suf_listener, &my_state);
   struct xdg_toplevel *xdgtpsuf = xdg_surface_get_toplevel(xdgsuf);
   xdg_toplevel_set_title(xdgtpsuf, "Client");
-  // wl_surface_commit(xdg_wlsurf);
-  struct wl_buffer *buf = create_buffer(&my_state);
-  wl_surface_attach(my_state.surface, buf, 0, 0);
-
+  xdg_toplevel_add_listener(xdgtpsuf, &xdg_tp_suf_listener, &my_state);
+  struct wl_callback *cb = wl_surface_frame(xdg_wlsurf);
+  wl_callback_add_listener(cb, &frame_callback_listener, &my_state);
+  wl_surface_commit(xdg_wlsurf);
   while (wl_display_dispatch(disp) != -1) {
-    my_state.offset = 0;
-    grid_update(my_state.grid);
-    update_buffer(&my_state);
-    struct wl_buffer *buf = create_buffer(&my_state);
-    wl_surface_attach(my_state.surface, buf, 0, 0);
-
-    // wl_surface_attach(my_state.surface, buf, 0, 0);
-    wl_surface_damage_buffer(my_state.surface, 0, 0, width, height);
-    wl_surface_commit(my_state.surface);
-    usleep(10000);
   }
   return 0;
 }
