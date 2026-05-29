@@ -1,0 +1,11 @@
+[package]
+name = "wayland-life"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }
+xkbcommon = "0.7"
+libc = "0.2"
+memmap2 = "0.9"

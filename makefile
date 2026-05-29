@@ -1,2 +1,3 @@
 all:
-	gcc -o client ./xdg-private.c ./client.c -lwayland-client -lrt -lxkbcommon -g
+	cargo build --release
+	cp target/release/wayland-life client
